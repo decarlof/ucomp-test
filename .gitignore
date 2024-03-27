@@ -1,0 +1,41 @@
+# the CMake build
+/build
+
+# built documentation
+/api-docs
+/api-userdocs
+
+# all config files
+/config/ucomp.*.cfg
+/config/ucompd.*.cfg
+
+# Python products
+.ipynb_checkpoints
+
+/docs/_build
+/docs/exports
+/docs/ucomp-product-guide.tex
+/docs/ucomp-product-guide.aux
+/docs/ucomp-product-guide.log
+/docs/ucomp-product-guide.pdf
+
+# temporary file used to find the SolarSoft dependencies
+/ssw/ROUTINES
+
+# ignore temporary data files from analysis
+/analysis/*.csv
+/analysis/*.txt
+/analysis/*.lst
+
+# OS generated files
+core
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.spyderworkspace
+*~
+

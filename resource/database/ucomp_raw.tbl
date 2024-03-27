@@ -1,0 +1,50 @@
+-- raw files
+create table ucomp_raw (
+  raw_id           int (10) auto_increment primary key,
+  file_name        char (40) not null,
+  date_obs         datetime not null,
+  obsday_id        mediumint (5) not null,
+
+  datatype         char(4),        -- data type of first extension
+  wave_region      char(4),
+
+  quality_id       tinyint (2) not null,
+  quality_bitmask  int,
+  level_id         tinyint (2) not null,
+
+  obs_plan         char (60),      -- name of current program
+  obs_id           char (60),      -- name of current measurement
+
+  t_rack           float(8, 3),
+  t_lcvr1          float(8, 3),
+  t_lcvr2          float(8, 3),
+  t_lcvr3          float(8, 3),
+  t_lnb1           float(8, 3),
+  t_mod            float(8, 3),
+  t_lnb2           float(8, 3),
+  t_lcvr4          float(8, 3),
+  t_lcvr5          float(8, 3),
+  t_base           float(8, 3),
+  tu_rack          float(8, 3),
+  tu_lcvr1         float(8, 3),
+  tu_lcvr2         float(8, 3),
+  tu_lcvr3         float(8, 3),
+  tu_lnb1          float(8, 3),
+  tu_mod           float(8, 3),
+  tu_lnb2          float(8, 3),
+  tu_lcvr4         float(8, 3),
+  tu_lcvr5         float(8, 3),
+  tu_base          float(8, 3),
+  tu_c0arr         float(8, 3),
+  tu_c0pcb         float(8, 3),
+  tu_c1arr         float(8, 3),
+  tu_c1pcb         float(8, 3),
+
+  unique(file_name),
+
+  index(date_obs),
+
+  foreign key (quality_id) references ucomp_quality(quality_id),
+  foreign key (level_id) references ucomp_level(level_id),
+  foreign key (obsday_id) references mlso_numfiles(day_id)
+)

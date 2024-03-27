@@ -1,0 +1,21 @@
+# u=rwx,g=rwx,o=rx
+umask 0002
+
+IDL=@IDL_EXECUTABLE@
+
+# IDL_DEFAULT will be wrong if IDL_DIR is set
+unset IDL_DIR
+
+MYSQL_LIBRARY=@MYSQL_LIBRARY@
+export LD_LIBRARY_PATH=$(dirname ${MYSQL_LIBRARY})
+
+export PATH=/usr/bin
+
+# setup IDL paths
+SSW_DIR=${PIPE_DIR}/ssw
+GEN_DIR=${PIPE_DIR}/gen
+LIB_DIR=${PIPE_DIR}/lib
+SRC_DIR=${PIPE_DIR}/src
+REGRESS_DIR=${PIPE_DIR}/regression
+UCOMP_PATH=+${SRC_DIR}:${REGRESS_DIR}:${SSW_DIR}:${GEN_DIR}:+${LIB_DIR}:"<IDL_DEFAULT>"
+UCOMP_DLM_PATH=+${LIB_DIR}:+${SRC_DIR}:"<IDL_DEFAULT>"

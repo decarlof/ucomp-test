@@ -1,0 +1,1544 @@
+#!@Python3_EXECUTABLE@
+
+import sys
+
+try:
+    import argparse
+    import collections
+    import datetime
+    from email.mime.text import MIMEText
+    import fnmatch
+    import glob
+    import os
+    import re
+    import smtplib
+    import socket
+    import subprocess
+    import time
+    import warnings
+
+    # import shtab
+
+    PY3 = sys.version_info[0] == 3
+
+    if PY3:
+        import configparser
+    else:
+        import ConfigParser as configparser
+
+    try:
+        import psutil
+        ps_requirements = True
+    except ModuleNotFoundError as e:
+        ps_requirements = False
+
+    try:
+        from astropy.io import fits
+        from astropy.utils.exceptions import AstropyUserWarning
+        ls_requirements = True
+    except ModuleNotFoundError as e:
+        ls_requirements = False
+
+    try:
+        import mysql
+        import mysql.connector
+        database_requirements = True
+    except ModuleNotFoundError as e:
+        database_requirements = False
+
+    try:
+        import packaging.specifiers
+        import packaging.version
+        versions_requirements = True
+    except ModuleNotFoundError as e:
+        versions_requirements = False
+
+    try:
+        import watchfiles
+        watch_requirements = True
+    except ModuleNotFoundError as e:
+        watch_requirements = False
+    except ImportError as e:
+        watch_requirments = False
+except KeyboardInterrupt:
+    print()
+    sys.exit(1)
+
+
+POLL_SECS = 0.1
+
+LEVELS = ["DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"]
+LOG_DIR = "/hao/acos/ucomp/logs"
+
+DATE_FORMAT = "%Y%m%d"
+
+DEVNULL = open(os.devnull, "w")
+PIPELINE_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONFIG_DIR = "@CONFIG_DIR@"
+
+
+# config file helpers
+# TODO: need to handle config file inheritance
+
+def get_config_filename(flags):
+    config_basename = f"ucomp.{flags}.cfg"
+
+    # construct config file filename
+    config_filename = os.path.join(CONFIG_DIR, config_basename)
+
+    return(config_filename)
+
+
+def get_config(flags, error):
+    config_filename = get_config_filename(flags)
+    if not os.path.isfile(config_filename):
+        config_basename = os.path.basename(config_filename)
+        error(f"configuration file does not exist: {config_basename}")
+
+    # read config file to get arguments to launch data/processing simulators
+    config = configparser.ConfigParser()
+    config.read(config_filename)
+
+    return(config)
+
+
+def get_dates(flags, error):
+    ucomp_config = get_config(flags, error)
+    try:
+        dates_expr = ucomp_config.get("options", "dates")
+        dates = parse_date_expr(dates_expr)
+    except configparser.NoSectionError:
+        error("no options section in config file")
+        dates = []
+    except configparser.NoOptionError:
+        error("missing dates option in config file")
+        dates = []
+    return(dates)
+
+
+def get_remote_location(flags, error):
+    ucomp_config = get_config(flags, error)
+
+    try:
+        raw_remote_server = ucomp_config.get("verification", "collection_server")
+        raw_remote_dir = ucomp_config.get("verification", "collection_basedir")
+    except configparser.NoSectionError:
+        error("no verification section in config file")
+    except configparser.NoOptionError:
+        error("missing raw remote server options in config file")
+    return(raw_remote_server, raw_remote_dir)
+
+
+def get_raw_basedir(date, flags, error):
+    ucomp_config = get_config(flags, error)
+
+    try:
+        raw_basedir = ucomp_config.get("raw", "basedir")
+    except configparser.NoSectionError:
+        error("no raw section in config file")
+    except configparser.NoOptionError:
+        routing_filename = ucomp_config.get("raw", "routing_file")
+        routing_config = configparser.ConfigParser()
+        routing_config.read(routing_filename)
+        date_locations = routing_config.options("ucomp-raw")
+        for date_expr in date_locations:
+            if fnmatch.fnmatch(date, date_expr):
+                return(routing_config.get("ucomp-raw", date_expr))
+    return(raw_basedir)
+
+
+def get_processing_basedir(date, flags, error):
+    ucomp_config = get_config(flags, error)
+
+    try:
+        raw_basedir = ucomp_config.get("processing", "basedir")
+    except configparser.NoSectionError:
+        error("no processing section in config file")
+    except configparser.NoOptionError:
+        routing_filename = ucomp_config.get("processing", "routing_file")
+        routing_config = configparser.ConfigParser()
+        routing_config.read(routing_filename)
+        date_locations = routing_config.options("ucomp-process")
+        for date_expr in date_locations:
+            if fnmatch.fnmatch(date, date_expr):
+                return(routing_config.get("ucomp-process", date_expr))
+    return(raw_basedir)
+
+
+def get_control_dir(flags, error):
+    ucomp_config = get_config(flags, error)
+    try:
+        control_dir = ucomp_config.get("control", "command_dir")
+    except configparser.NoSectionError:
+        control_dir = None
+    except configparser.NoOptionError:
+        control_dir = None
+    return(control_dir)
+
+
+# date handling helpers
+
+intervals = (
+    ("weeks", 604800),  # 60 * 60 * 24 * 7 seconds
+    ("days", 86400),    # 60 * 60 * 24 seconds
+    ("hrs", 3600),      # 60 * 60 seconds
+    ("mins", 60),
+    ("secs", 1),
+    )
+
+def display_time(seconds, granularity=2):
+    result = []
+
+    for name, count in intervals:
+        value = seconds // count
+        if value:
+            seconds -= value * count
+            if value == 1:
+                name = name.rstrip("s")
+            result.append("%d %s" % (value, name))
+    return " ".join(result[:granularity])
+
+
+def format_timedelta(timedelta):
+    return(display_time(int(timedelta.total_seconds()), granularity=len(intervals)))
+
+
+def convert_boolean(value):
+    return True if value.lower() in {"1", "yes", "true"} else False
+
+
+def notify_completed(args, task):
+    config_filename = get_config_filename(args.flags)
+    config = get_config(args.flags, args.parser.error)
+
+    try:
+        send_notification = convert_boolean(config.get("notifications", "send"))
+    except (configparser.NoSectionError, configparser.NoOptionError) as e:
+        send_notification = False
+
+    try:
+        notification_email = config.get("notifications", "email")
+    except (configparser.NoSectionError, configparser.NoOptionError) as e:
+        send_notification = False
+
+    if send_notification:
+        userhome = os.path.expanduser("~")
+        user = os.path.split(userhome)[-1]
+        hostname = socket.gethostname()
+
+        dates = ",".join(args.dates)
+
+        with open(config_filename, "r") as f:
+            text = f.read()
+
+        msg = MIMEText(text)
+        msg["Subject"] = f"UCoMP {task} [{args.flags}] job completed for {dates} on {hostname}"
+        msg["From"] = f"{user}@ucar.edu"
+        msg["To"] = notification_email
+
+        s = smtplib.SMTP("localhost")
+        try:
+            refused_recipients = s.send_message(msg)
+            for r in refused_recipients:
+                print(r)
+        except smtplib.SMTPRecipientsRefused as e:
+            print(e)
+        except smtplib.SMTPHeloError as e:
+            print(e)
+        except smtplib.SMTPSenderRefused as e:
+            print(e)
+        except smtplib.SMTPDataError as e:
+            print(e)
+
+        exit_code, exit_message = s.quit()
+
+
+# list sub-command
+
+def list_processes(args):
+    if not ps_requirements:
+        args.parser.error("missing Python packages required for listing processes")
+
+    ucomp_processes = []
+    for p in psutil.process_iter():
+        cmdline = p.cmdline()
+        cmdline = "" if len(cmdline) == 0 else cmdline[-1]
+        if p.name() == "idl" and cmdline.startswith("ucomp"):
+            ucomp_processes.append({"cmdline": cmdline,
+                                    "pid": p.pid,
+                                    "start_time": p.create_time()})
+    if len(ucomp_processes) == 0:
+        print("no UCoMP processes currently running")
+        return
+
+    now = datetime.datetime.now()
+
+    for p in ucomp_processes:
+        started = datetime.datetime.fromtimestamp(p["start_time"])
+        time_running = now - started
+        start_time = started.strftime("%Y-%m-%d %H:%M:%S")
+        print("[%d] (%s running %s): %s" % (p["pid"],
+                                            start_time,
+                                            format_timedelta(time_running), p["cmdline"]))
+
+
+# verify sub-command
+
+def verify(args):
+    if len(args.dates) == 0:
+        args.parser.error("too few arguments")
+
+    dates = ",".join(args.dates)
+    cmd = [os.path.join(PIPELINE_DIR,
+                        "bin",
+                        "ucomp_verify_dates.sh"),
+           args.flags,
+           dates]
+
+    process = subprocess.Popen(cmd, stderr=subprocess.STDOUT)
+    print(f"verifying processing for {dates}")
+    if args.verbose: print("[%d] %s" % (process.pid, " ".join(cmd)))
+    terminated = wait_for(process)
+
+
+# ls sub-command
+
+def file_lines(filename):
+    n_lines = 0
+
+    with open(filename, "r") as f:
+        for line in f.readlines():
+            n_lines += 1
+    return(n_lines)
+
+
+def list_fits_file_default(f):
+    basename = os.path.basename(f)
+    try:
+        with fits.open(f) as fits_file:
+            primary_header = fits_file[0].header
+            header_1 = fits_file[1].header
+            s = "s" if len(fits_file) != 2 else ""
+            n_exts = f"{len(fits_file) - 1} ext{s}"
+            if "FILTER" in primary_header:
+                wave_region = primary_header["FILTER"]
+                if type(wave_region) == float:
+                    wave_region = f"{wave_region:4.0f} nm"
+                elif len(wave_region) > 0:
+                    wave_region = f"{wave_region:>4s} nm"
+            else:
+                wave_region = 7 * "-"
+            data_type = f"{header_1['DATATYPE']}" if "DATATYPE" in header_1 else 3 * "-"
+        print(f"{basename:38s}  {n_exts:8s}  {wave_region:7s}  [{data_type}]")
+    except FileNotFoundError:
+        print(f"{basename} not found")
+
+
+def value2str(v, format=None):
+    if format is not None:
+        template = f"{{v{format}}}"
+        return(template.format(v=v))
+    if type(v) == str:
+        return(f"{v:10s}")
+    elif type(v) == float:
+        return(f"{v:8.3f}")
+    elif type(v) == int:
+        return(f"{v:8d}")
+    elif type(v) == bool:
+        return(f"{v!s:5s}")
+    elif v is None:
+        return 5 * "-"
+    return(f"{v}")
+
+
+def list_fits_file(f, columns):
+    basename = os.path.basename(f)
+    line = f"{basename:38s}"
+    try:
+        with fits.open(f) as fits_file:
+            primary_header = fits_file[0].header
+            header_1 = fits_file[1].header
+            for c in columns:
+                v = primary_header[c] if c in primary_header else None
+                if v is None:
+                    v = header_1[c] if c in header_1 else None
+                v = value2str(v)
+                line += f"  {v}"
+        print(line)
+    except FileNotFoundError:
+        print(f"{basename} not found")
+
+
+def list_files(files, columns=None):
+    line_character = "\u23AF"
+    endpt_character = "\u279B"
+
+    max_files = 1400
+    files_per_hash = 25
+    width = max_files // files_per_hash
+
+    for f in files:
+        basename = os.path.basename(f)
+        if os.path.isdir(f):
+            n_subfiles = len(glob.glob(os.path.join(f, "*")))
+            n_fits_files = len(glob.glob(os.path.join(f, "**/*.fts*"), recursive=True))
+            name = f"{basename}/"
+            if n_fits_files > 0:
+                length = n_fits_files // files_per_hash
+                if length > width:
+                    bar = (width - 1) * line_character + endpt_character
+                else:
+                    bar = length * line_character
+                print(f"{name:20s} {bar:{width}s} {n_fits_files:4d} FITS files")
+            else:
+                print(f"{name:20s} {n_subfiles} files")
+        elif os.path.isfile(f):
+            filename, file_extension = os.path.splitext(f)
+            if file_extension == ".tgz":
+                size = os.stat(f).st_size
+                print(f"{basename:38s}  {size} bytes")
+                continue
+
+            try:
+                if columns is None:
+                    list_fits_file_default(f)
+                else:
+                    list_fits_file(f, columns)
+            except OSError:
+                if file_extension in [".log", ".olog", ".txt", ".cfg", ".tarlist"]:
+                    n_lines = file_lines(f)
+                    s = "s" if n_lines != 1 else ""
+                    print(f"{basename:38s}  {n_lines} line{s}")
+                else:
+                    size = os.stat(f).st_size
+                    print(f"{basename:38s}  {size} bytes")
+        else:
+            print(f"{f} - unknown item")
+
+
+def ls(args):
+    if not ls_requirements:
+        args.parser.error("missing Python packages required for listing FITS files")
+
+    try:
+        files = [f for f in args.files if os.path.isfile(f)]
+        dirs = [d for d in args.files if os.path.isdir(d)]
+
+        if len(files) == 0 and len(dirs) == 1:
+            items = [f for f in glob.glob(os.path.join(dirs[0], "*"))]
+            files = [f for f in items if os.path.isfile(f)]
+            dirs = [d for d in items if os.path.isdir(d)]
+
+        if args.keywords is None:
+            columns = None
+        else:
+            columns = args.keywords.split(",")
+
+        list_files(sorted(dirs))
+        list_files(sorted(files), columns=columns)
+    except KeyboardInterrupt:
+        pass
+
+
+# cat sub-command
+
+def cat(args):
+    if not ls_requirements:
+        args.parser.error("missing Python packages required for listing contents of FITS files")
+
+    if args.header:
+        cat_header(args)
+    else:
+        cat_keywords(args)
+
+
+def cat_header(args):
+    with warnings.catch_warnings():
+        if not args.validate:
+            warnings.simplefilter("ignore", AstropyUserWarning)
+        for file in args.files:
+            try:
+                with fits.open(file) as f:
+                    header = f[args.extension].header
+                    print(repr(header))
+            except FileNotFoundError:
+                print(f"{file} not found")
+
+def cat_keywords(args):
+    # TODO: default keywords should vary by level of the data
+    default_keywords = {"sci": ["EXTNAME", "DATATYPE", "DATE-BEG", "WAVELNG", "ONBAND"],
+                        "science": ["EXTNAME", "DATATYPE", "DATE-BEG", "WAVELNG", "ONBAND"],
+                        "cal": ["EXTNAME", "DATATYPE", "DATE-BEG", "WAVELNG", "ONBAND", "POLANGLE", "RETANGLE"],
+                        "dark": ["EXTNAME", "DATATYPE", "DATE-BEG"],
+                        "flat": ["EXTNAME", "DATATYPE", "DATE-BEG", "WAVELNG", "ONBAND"],
+                        "unknown": ["EXTNAME"]}
+    default_formats = {"EXTNAME": ":25s", "DATATYPE": ":7s", "DATE-BEG": ":22s",
+                       "WAVELNG": ":7.2f", "ONBAND": "!s:5s", "POLANGLE": ":5.1f",
+                       "RETANGLE": ":5.1f"}
+    # TODO: add defaults for L1 and master flat/dark files
+    try:
+        for i, f in enumerate(args.files):
+            if i != 0: print()
+            if len(args.files) > 1: print(f)
+            try:
+                with fits.open(f) as fits_file:
+                    for e, hdu in enumerate(fits_file):
+                        if e == 0:
+                            continue
+
+                        if args.keywords is None:
+                            if "DATATYPE" in hdu.header:
+                                datatype = hdu.header["DATATYPE"]
+                            else:
+                                datatype = "unknown"
+                            keywords = default_keywords[datatype]
+                        else:
+                            keywords = args.keywords.split(",")
+
+                        line = f"{e:3d}"
+                        for k in keywords:
+                            if k in hdu.header:
+                                value = hdu.header[k]
+                                fmt = default_formats[k] if k in default_formats else None
+                                line += "  " + value2str(value, format=fmt)
+                            else:
+                                line += "  " + 5 * "-"
+                        print(line)
+            except FileNotFoundError:
+                print(f"{f} not found")
+    except KeyboardInterrupt:
+        pass
+
+
+# diff sub-command
+
+def diff(args):
+    if not ls_requirements:
+        args.parser.error("missing Python packages required for diffing contents of FITS files")
+
+    a = args.files[0]
+    b = args.files[1]
+
+    for f in [a, b]:
+        if not os.path.exists(f):
+            args.parser.error(f"{f} does not exist")
+
+    differences = fits.FITSDiff(a, b)
+    hdu_count = differences.diff_hdu_count
+
+    is_same = True
+    if len(hdu_count) == 0:
+        for hdu_differences in differences.diff_hdus:
+            if args.extension is None or args.extension == hdu_differences[0]:
+                is_same = report_hdu_differences(hdu_differences) and is_same
+    else:
+        is_same = False
+        print(f"< {hdu_count[0]} HDUs")
+        print(f"> {hdu_count[1]} HDUs")
+
+    sys.exit(0 if is_same else 1)
+
+
+def report_hdu_differences(hdu_differences):
+    ext_no = hdu_differences[0]
+    hdu_diff = hdu_differences[1]
+
+    header_same, header_diffs = report_header_differences(hdu_diff.diff_headers)
+    data_same, data_diffs = report_data_differences(hdu_diff.diff_data)
+
+    if not header_same or not data_same:
+        print(f"extension {ext_no}:")
+
+    if not header_same:
+        print(header_diffs)
+
+    if not data_same:
+        print(data_diffs)
+
+    return(header_same and data_same)
+
+
+def report_header_differences(header_differences):
+    is_same = header_differences.identical
+    diffs = header_differences.report(indent=1)
+    return(is_same, diffs)
+
+
+def report_data_differences(data_differences):
+    is_same = data_differences.identical
+    diffs = data_differences.report(indent=1)
+    return(is_same, diffs)
+
+
+# validate sub-command
+
+def validate(args):
+    cmd = [os.path.join(PIPELINE_DIR,
+                        "bin",
+                        "ucomp_validate_files.sh"),
+           args.flags,
+           "20210205",
+           args.level,
+           " ".join(args.files)]
+
+    process = subprocess.Popen(cmd, stderr=subprocess.STDOUT)
+    terminated = wait_for(process)
+
+
+# log sub-command
+
+def prune_logfiles(files, max_version):
+    version_re = re.compile("\d+")
+    for f in files:
+        versions = glob.glob("%s.*" % f)
+        for v in versions:
+            n = v[len(f) + 1:]
+            if version_re.match(n):
+                if int(n) > max_version:
+                    file_to_delete = f"{f}.{n}"
+                    print(f"rm {file_to_delete}")
+                    os.remove(file_to_delete)
+
+
+def filter_file(logfile, level_index, follow, tail=None):
+    loglevel_filter = "|".join(LEVELS[level_index:])
+    loglevel_prog = re.compile(".*(%s):.*" % loglevel_filter)
+    logstart_prog = re.compile("(\[\d+\] )?\d{8}.\d{6}")
+
+    matched_last_line = False
+
+    line = "not empty"
+
+    if tail is not None:
+        queue = collections.deque(maxlen=tail)
+
+    try:
+        with open(logfile, "r") as f:
+            try:
+                while follow or line != "":
+                    line = f.readline()
+                    if line == "":
+                        try:
+                            time.sleep(POLL_SECS)
+                        except IOError:
+                            return
+                        continue
+
+                    if loglevel_prog.match(line):
+                        matched_last_line = True
+                        try:
+                            if tail is None:
+                                print(line.rstrip())
+                            else:
+                                queue.append(line.rstrip())
+                        except IOError:
+                            return
+                    else:
+                        if matched_last_line:
+                            if logstart_prog.match(line):
+                                matched_last_line = False
+                            else:
+                                try:
+                                    if tail is None:
+                                        print(line.rstrip())
+                                    else:
+                                        queue.append(line.rstrip())
+                                except IOError:
+                                    return
+            except KeyboardInterrupt:
+                print()
+                return
+    except IOError:
+        print("Problem reading %s" % logfile)
+
+    if tail is not None:
+        for line in queue:
+            print(line)
+
+
+def filter_log(args):
+    date_re = "^\d{8}$"
+    date_prog = re.compile(date_re)
+
+    logfiles = []
+    for f in args.logfiles:
+        if date_prog.match(f):
+            path1 = os.path.join(LOG_DIR, f + ".log")
+            if os.path.isfile(path1):
+                logfiles.append(path1)
+            else:
+                path2 = os.path.join(LOG_DIR, f + ".ucomp.eod.log")
+                if os.path.isfile(path2):
+                    logfiles.append(path2)
+                else:
+                    args.parser.error(f + " does not exist")
+        else:
+            logfiles.append(f)
+
+    follow = args.follow
+    tail = args.tail
+    if follow and len(logfiles) > 1:
+        args.parser.error("cannot follow multiple files")
+        return
+
+    if follow and tail:
+        args.parser.error("cannot follow and tail a file")
+
+    if args.prune is not None:
+        prune_logfiles(logfiles, int(args.prune))
+        return
+
+    # default is to not filter
+    if args.level:
+        level = args.level.upper()
+    elif args.critical:
+        level = "CRITICAL"
+    elif args.error:
+        level = "ERROR"
+    elif args.warn:
+        level = "WARN"
+    elif args.info:
+        level = "INFO"
+    else:
+        level = "DEBUG"
+
+    try:
+        level_index = LEVELS.index(level)
+    except ValueError:
+        print(f"invalid level: {level}")
+        parser.print_help()
+        return
+
+    for i, f in enumerate(logfiles):
+        if len(logfiles) > 1:
+            if i != 0: print("")
+            print(f)
+            print("-" * len(f))
+        filter_file(f, level_index, follow, tail=10 if tail else None)
+
+
+# missing sub-command
+def missing(args):
+    dates = parse_date_expr(",".join(args.dates))
+    if args.script:
+        raw_remote_server, raw_remote_dir = get_remote_location(args.flags, args.parser.error)
+    for d in dates:
+        raw_basedir = get_raw_basedir(d, args.flags, args.parser.error)
+        raw_dir = os.path.join(raw_basedir, d)
+        present_files = glob.glob(os.path.join(raw_dir, "*.fts"))
+        machine_log = os.path.join(raw_dir, f"{d}.ucomp.machine.log")
+        if os.path.exists(machine_log):
+            with open(machine_log, "r") as f:
+                created_files = [line.split()[0] for line in f]
+            if len(created_files) == 1 and created_files[0] == os.path.basename(machine_log) + ":":
+                created_files = []
+        else:
+            created_files = []
+
+        present_files = [os.path.basename(f) for f in present_files]
+
+        if args.script:
+            raw_remote_datedir = os.path.join(raw_remote_dir, d)
+            print("#!/bin/sh")
+            print(f"REMOTE_LOCATION={raw_remote_server}:{raw_remote_datedir}")
+            print(f"LOCAL_LOCATION={raw_dir}")
+            print()
+
+        for cf in created_files:
+            if cf not in present_files:
+                if args.script:
+                    print(f"scp $REMOTE_LOCATION/{cf} $LOCAL_LOCATION")
+                else:
+                    print(cf)
+
+
+def has_raw_data(date, flags, error):
+    raw_basedir = get_raw_basedir(date, flags, error)
+    raw_dir = os.path.join(raw_basedir, date)
+    fits_glob = os.path.join(raw_dir, '*.fts*')
+    fits_files = glob.glob(fits_glob)
+    return(len(fits_files) > 0)
+
+
+def processed_locked(date, flags, error):
+    processing_basedir = get_processing_basedir(date, flags, error)
+    processing_dir = os.path.join(processing_basedir, date)
+    lock_filename = os.path.join(processing_dir, ".lock")
+    return(os.path.exists(lock_filename))
+
+
+# versions sub-command
+def versions(args):
+    if not database_requirements:
+        args.parser.error("missing Python packages required for querying database")
+    if not versions_requirements:
+        args.parser.error("missing Python packages required for comparing versions")
+
+    dates = split_dates(",".join(args.dates), args.parser.error)
+    host, user, password, port, database = get_login(args.flags, args.parser.error)
+
+    versions_list = []
+    try:
+        connection = mysql.connector.connect(host=host, user=user, password=password)
+        cursor = connection.cursor()
+        for d in dates:
+            versions_list.append(get_version(d, cursor))
+    except mysql.connector.Error as e:
+        print(e)
+    finally:
+        cursor.close()
+        connection.close()
+
+    filter = make_version_filter(args.filter)
+
+    if args.oldest:
+        f = [v for v in versions_list if v[1] is not None and v[1][0] != "-"]
+        s = sorted(f, key=lambda v: packaging.version.parse(v[1]))
+        for d, v, r in s:
+            if v != "<unknown>":
+                print(f"{d}: {v:12s} {r:8s}")
+                break
+    if args.none:
+        f = [v for v in versions_list if v[1] is not None and v[1][0] != "-"]
+        no_version = [v for v in versions_list if v[1] is None or v[1][0] == "-"]
+        in_progress = [v for v in no_version if has_raw_data(v[0], args.flags, args.parser.error)]
+        for d, v, r in in_progress:
+            attribute = "L" if processed_locked(d, args.flags, args.parser.error) else "+"
+            v = v if v is not None else 12 * "-"
+            r = r if r is not None else 12 * "-"
+            print(f"{d}: {attribute} {v:12s} {r:8s}")
+    elif args.summary:
+        f = [v for v in versions_list if v[1] is not None and v[1][0] != "-"]
+        no_version = [v for v in versions_list if v[1] is None or v[1][0] == "-"]
+        in_progress = [v for v in no_version if has_raw_data(v[0], args.flags, args.parser.error) and processed_locked(v[0], args.flags, args.parser.error)]
+        n_in_progress = len(in_progress)
+        if n_in_progress > 0:
+            plural = "s" if n_in_progress > 1 else ""
+            print(f"--L--: {n_in_progress} day{plural}")
+        not_processed = [v for v in no_version if has_raw_data(v[0], args.flags, args.parser.error) and not processed_locked(v[0], args.flags, args.parser.error)]
+        n_not_processed = len(not_processed)
+        if n_not_processed > 0:
+            plural = "s" if n_not_processed > 1 else ""
+            print(f"-----: {n_not_processed} day{plural}")
+
+        s = sorted(f, key=lambda v: packaging.version.parse(v[1]))
+        current_version = ''
+        n_dates = 0
+        for d, v, r in s:
+            if v == current_version:
+                n_dates += 1
+            else:
+                if n_dates != 0 and filter(current_version):
+                    plural = "s" if n_dates > 1 else ""
+                    print(f"{current_version}: {n_dates} day{plural}")
+                current_version = v
+                n_dates = 1
+        else:
+            if n_dates > 0 and filter(current_version):
+                plural = "s" if n_dates > 1 else ""
+                print(f"{current_version}: {n_dates} day{plural}")
+    else:
+        for d, v, r in versions_list:
+            if has_raw_data(d, args.flags, args.parser.error):
+                if processed_locked(d, args.flags, args.parser.error):
+                    attribute = "L"
+                else:
+                    attribute = "+"
+            else:
+                attribute = "-"
+
+            if filter(v):
+                v = v if v is not None else 12 * "-"
+                r = r if r is not None else 12 * "-"
+                print(f"{d}: {attribute} {v:12s} {r:8s}")
+
+
+def make_version_filter(filter_expression):
+    def null_filter(version):
+        return True
+
+    if filter_expression is None:
+        return(null_filter)
+
+    def filter_function(version):
+        if version is None:
+            return(False)
+        if version.startswith("-"):
+            return(False)
+        return(packaging.version.parse(version) in spec)
+
+    spec = packaging.specifiers.SpecifierSet(filter_expression, prereleases=True)
+    return(filter_function)
+
+
+def get_version(date, cursor):
+    null_version = "----------"
+    null_revision = "--------"
+    unknown_version = "<unknown>"
+    unknown_revision = "<unknown>"
+
+    year  = date[0:4]
+    month = date[4:6]
+    day   = date[6:8]
+    q = f"select * from MLSO.mlso_numfiles where obs_day='{year}-{month}-{day}';"
+    cursor.execute(q)
+    row = cursor.fetchone()
+    if row is None:
+        return(date, None, None)
+    else:
+        day_id = row[0]
+
+        q = f"select ucomp_sw_id from MLSO.ucomp_eng where obsday_id={day_id} limit 1;"
+        cursor.execute(q)
+        row = cursor.fetchone()
+        if row is None:
+            return(date, null_version, null_revision)
+        else:
+            sw_id = row[0]
+            if sw_id is None:
+                return(date, unknown_version, unknown_revision)
+
+            q = f"select * from MLSO.ucomp_sw where sw_id={sw_id};"
+            cursor.execute(q)
+            row = cursor.fetchone()
+            if row is None:
+                return(date, null_version, null_revision)
+            else:
+                return(date, row[2], row[3])
+
+
+def increment_date(date):
+    format = "%Y%m%d"
+    d = datetime.datetime.strptime(date, format)
+    d += datetime.timedelta(days=1)
+    return(d.strftime(format))
+
+
+def split_dates(date_expr, error):
+    dates = []
+    date_re = re.compile("^[12][0-9]{7}$")
+    date_range_re = re.compile("^[12][0-9]{7}-[12][0-9]{7}$")
+    for d in date_expr.split(","):
+        if date_re.match(d):
+            dates.append(d)
+        elif date_range_re.match(d):
+            start_date = d[0:8]
+            end_date = d[9:17]
+            if end_date <= start_date:
+                error(f"end of range before start of range: {d}")
+            date = start_date
+            while date < end_date:
+                dates.append(date)
+                date = increment_date(date)
+        else:
+            error(f"invalid date expression: {d}")
+
+    return(dates)
+
+
+def get_login(flags, error):
+    config_basename = f"ucomp.{flags}.cfg"
+
+    # construct config file filename
+    config_filename = get_config_filename(flags)
+    if not os.path.isfile(config_filename):
+        basename = os.path.basename(config_filename)
+        error(f"configuration file does not exist: {basename}")
+
+    ucomp_config = configparser.ConfigParser()
+    ucomp_config.read(config_filename)
+
+    try:
+        mysql_config_filename = ucomp_config.get("database", "config_filename")
+        mysql_config_section = ucomp_config.get("database", "config_section")
+    except configparser.NoSectionError:
+        args.parser.error("database information not specified")
+
+    mysql_config = configparser.ConfigParser()
+    mysql_config.read(mysql_config_filename)
+
+    try:
+        host = mysql_config.get(mysql_config_section, "host")
+        user = mysql_config.get(mysql_config_section, "user")
+        password = mysql_config.get(mysql_config_section, "password")
+        port = mysql_config.get(mysql_config_section, "port")
+        database = mysql_config.get(mysql_config_section, "database")
+    except configparser.NoSectionError:
+        args.parser.error("incomplete database information")
+
+    return(host, user, password, port, database)
+
+
+# database sub-command
+def database(args):
+    if not database_requirements:
+        args.parser.error("missing Python packages required for querying database")
+
+    host, user, password, port, database = get_login(args.flags, args.parser.error)
+
+    keep_columns = None if args.columns is None else args.columns.split(',')
+
+    try:
+        connection = mysql.connector.connect(host=host, user=user, password=password)
+        cursor = connection.cursor()
+        cursor.execute(args.query)
+        rows = cursor.fetchall()
+        if rows:
+            print_db_rows(keep_columns, cursor.column_names, rows)
+    except mysql.connector.Error as e:
+        print(e)
+    finally:
+        cursor.close()
+        connection.close()
+
+def print_db_rows(keep_columns, columns, rows):
+    # filter rows to get results to be displayed
+    results = [filter_db_row(keep_columns, columns, r) for r in rows]
+
+    # determine max length of each field
+    test_columns = columns if keep_columns is None else keep_columns
+    max_lengths = [0 for i in range(len(test_columns))]
+    alignments = [type_alignment_symbol(f) for f in results[0]]
+    for r in results:
+        lengths = [len(str(f)) for f in r]
+        for i, length in enumerate(lengths):
+            if lengths[i] > max_lengths[i]:
+                max_lengths[i] = lengths[i]
+
+    for r in results:
+        line = '  '.join([f"{{f:{alignments[i]}{max_lengths[i]}s}}".format(f=str(f)) for i, f in enumerate(r)])
+        print(line)
+
+def type_alignment_symbol(x):
+    if type(x) == float or type(x) == int:
+        sym = ">"
+    else:
+        sym = "<"
+    return(sym)
+
+def filter_db_row(keep_columns, columns, row):
+    if keep_columns is None:
+        return(row)
+    return([row[i] for i, c in enumerate(columns) if c in keep_columns])
+
+
+# watch sub-command
+def watch(args):
+    if not database_requirements:
+        args.parser.error("missing Python packages required for watch")
+
+    raw_basedir = get_raw_basedir(args.date, args.flags, args.parser.error)
+    raw_dir = os.path.join(raw_basedir, args.date)
+    print(f"watching {raw_dir}...")
+
+    try:
+        for changes in watchfiles.watch(raw_dir):
+            for c in changes:
+                print(f"{c[0].name} {c[1]}")
+    except KeyboardInterrupt:
+        print()
+        return
+
+
+# realtime, eod, and calibrate sub-commands
+def parse_date_expr(date_expr):
+    dates = []
+
+    try:
+        for de in date_expr.split(","):
+            d = de.split("-")
+            if len(d) not in [1, 2]:
+                print(f"invalid syntax: {de}")
+                return []
+
+            if len(d) == 1:
+                date_string = d[0]
+                date = datetime.datetime.strptime(date_string, DATE_FORMAT)
+                dates.append(date.strftime(DATE_FORMAT))
+
+            if len(d) == 2:
+                date_string = d[0]
+                date = datetime.datetime.strptime(date_string, DATE_FORMAT)
+                date_string = d[1]
+                end_date = datetime.datetime.strptime(date_string, DATE_FORMAT)
+                if date > end_date:
+                    print(f"invalid date range {de}")
+                    return []
+                while date.strftime(DATE_FORMAT) != end_date.strftime(DATE_FORMAT):
+                    dates.append(date.strftime(DATE_FORMAT))
+                    date = date + datetime.timedelta(days=1)
+    except ValueError:
+        print(f"invalid date syntax: {date_string}")
+        return []
+
+    return dates
+
+
+def check_for_control(args):
+    control_dir = get_control_dir(args.flags, args.parser.error)
+    if control_dir is None:
+        return(False, "")
+
+    stop = os.path.exists(os.path.join(control_dir, "stop"))
+
+    try:
+        with open(os.path.join(control_dir, "version"), "r") as f:
+            version = f.readline().rstrip("\n")
+            version = f".{version}"
+    except:
+        version = ""
+
+    return(stop, version)
+
+
+def process_eod(args):
+    launch_processes(args, "ucomp_eod_wrapper")
+    notify_completed(args, "end-of-day")
+
+
+def process_rt(args):
+    launch_processes(args, "ucomp_realtime_wrapper")
+    notify_completed(args, "realtime")
+
+
+def process_cal(args):
+    launch_processes(args, "ucomp_calibration_wrapper")
+    notify_completed(args, "calibration")
+
+
+def reprocess(args):
+    launch_processes(args, "ucomp_reprocess_wrapper")
+    notify_completed(args, "reprocess")
+
+
+def clearday(args):
+    launch_processes(args, "ucomp_clearday_wrapper")
+    notify_completed(args, "clear day")
+
+
+def regression(args):
+    launch_processes(args, "ucomp_regression_wrapper")
+    notify_completed(args, "regression")
+
+
+def launch_processes(args, routine):
+    # command line dates override options/dates in config file, error if no
+    # dates in either
+    if len(args.dates) == 0:
+        dates = get_dates(args.flags, args.parser.error)
+        if len(dates) == 0:
+            args.parser.error("no date arguments and none in config file")
+    else:
+        dates = parse_date_expr(",".join(args.dates))
+
+    config_filename = get_config_filename(args.flags)
+
+    if len(dates) != 1 and routine == "ucomp_realtime_wrapper":
+        args.parser.error("realtime mode is only valid for a single date")
+
+    stop = False
+    version = ""
+    for d in dates:
+        if routine == "ucomp_reprocess_wrapper":
+            stop, version = check_for_control(args)
+
+        if stop:
+            print("received stop command, stopping")
+            break
+
+        cmd = [os.path.join(f"{PIPELINE_DIR}{version}",
+                            "bin",
+                            "ucomp_script.sh"),
+               routine,
+               config_filename,
+               d]
+
+        process = subprocess.Popen(cmd, stderr=subprocess.STDOUT)
+        print(f"launching script {routine} with {args.flags} flags on {d}")
+        if args.verbose: print("[%d] %s" % (process.pid, " ".join(cmd)))
+        if not args.no_wait:
+            terminated = wait_for(process)
+            if terminated: break
+
+
+def wait_for(process):
+    """Wait for the given process to finish. Returns true if the process was
+       terminated by a keyboard interrupt."""
+    try:
+        process.wait()
+        return 0
+    except KeyboardInterrupt:
+        print("killing process %d" % process.pid)
+        process.kill()
+        return 1
+
+
+# script sub-command
+def run_script(args):
+    launch_processes(args, args.name)
+    notify_completed(args, f"script ({args.name})")
+
+
+# archive sub-command
+def archive(args):
+    if args.level is None:
+        args.parser.error("no level specified")
+    launch_processes(args, f"ucomp_l{args.level}_archive_wrapper")
+    notify_completed(args, f"archive")
+
+
+# simulate sub-command
+
+def simulate(args):
+    dates = parse_date_expr(",".join(args.date))
+
+    if len(dates) != 1:
+        args.parser.error("simulating is only valid for a single date")
+
+    # read config file to get options
+    pipeline_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    config_filename = get_config_filename(args.flags)
+
+    config = configparser.ConfigParser()
+    config.read(config_filename)
+
+    depot_basedir = config.get("simulator", "depot_basedir")
+    raw_basedir = config.get("raw", "basedir")
+    raw_dir = os.path.join(raw_basedir, dates[0])
+
+    arrival_interval = config.get("simulator", "arrival_interval", "60.0")
+    launch_interval = config.get("simulator", "launch_interval", "60.0")
+
+    # launch processing simulator
+    processing_cmd = [os.path.join(pipeline_dir, "bin", "ucomp_simulate_processing"),
+                      "-f", args.flags,
+                      "--launch-interval", launch_interval,
+                      dates[0]]
+    if args.no_eod:
+        processing_cmd.insert(1, "--no-eod")
+    processing_process = subprocess.Popen(processing_cmd)
+
+    time.sleep(5.0)
+
+    # launch incoming data simulator
+    data_cmd = [os.path.join(pipeline_dir, "bin", "ucomp_simulate_data"),
+                "-r", raw_dir,
+                "--arrival-interval", arrival_interval,
+                os.path.join(depot_basedir, date[0])]
+    data_process = subprocess.Popen(data_cmd)
+
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("killing data (%d) and processing (%d) subprocesses..." % (data_process.pid, processing_process.pid))
+        processing_process.kill()
+        data_process.kill()
+
+
+def print_help(args):
+    args.parser.print_help()
+
+
+if __name__ == "__main__":
+    name = "UCoMP pipeline @GIT_VERSION@ [@GIT_REVISION@] (@GIT_BRANCH@)"
+
+    parser = argparse.ArgumentParser(description=name)
+
+    # top-level options
+    parser.add_argument("-v", "--version",
+        action="version",
+        version=name)
+
+    # show help if no sub-command given
+    parser.set_defaults(func=print_help, parser=parser)
+
+    # TODO: it would be nice to arrange sub-commands into groups, but that is
+    # not possible with argparse right now
+    # helpers: list, ls, cat, validate, log, versions, database, watch
+    # processing: rt, eod, cal, reprocess
+    # clearday, archive
+    # testing: regress, simulate, verify
+    # etc: script
+    subparsers = parser.add_subparsers(help="sub-command help")
+
+    date_help = """dates to run on in the form YYYYMMDD including lists (using
+                   commas) and ranges (using hyphens where end date is not
+                   included)
+                """
+    flags_help = """FLAGS section of config filename, i.e., file in config/
+                    directory matching ucomp.FLAGS.cfg will be used"""
+
+    # list sub-command
+    list_parser = subparsers.add_parser("list",
+        help="list running UCoMP processes")
+    list_parser.set_defaults(func=list_processes, parser=list_parser)
+
+    # ls sub-command
+    ls_parser = subparsers.add_parser("ls",
+        help="list files with extra UCoMP-specific info")
+    ls_parser.add_argument("files", nargs="*",
+        default=".",
+        help="UCoMP files(s)",
+        metavar="file(s)")
+    ls_parser.add_argument("-k", "--keywords", type=str,
+        help="FITS keyword names to display",
+        default=None)
+    ls_parser.set_defaults(func=ls, parser=ls_parser)
+
+    # cat sub-command
+    cat_parser = subparsers.add_parser("cat",
+        help="list the contents of the extensions of a UCoMP file")
+    cat_parser.add_argument("files", nargs="+",
+       help="UCoMP files",
+       metavar="files")
+    cat_parser.add_argument("-k", "--keywords", type=str,
+       help="FITS keyword names to display",
+       default=None)
+    cat_parser.add_argument("--validate",
+       help="validate header",
+       action="store_true")
+    cat_parser.add_argument("-r", "--header",
+       help="display entire header",
+       action="store_true")
+    cat_parser.add_argument("-e", "--extension", type=int,
+       help="used with --header to specify which extension header to display",
+       default=0)
+    cat_parser.set_defaults(func=cat, parser=cat_parser)
+
+    # diff sub-command
+    diff_parser = subparsers.add_parser("diff",
+        help="report differences in UCoMP files")
+    diff_parser.add_argument("files", nargs=2, help="UCoMP file",
+        metavar="file")
+    diff_parser.add_argument("-e", "--extension", type=int,
+        help="used to specify which extension header to display differences for",
+        default=None)
+    diff_parser.set_defaults(func=diff, parser=diff_parser)
+
+    # validate sub-command
+    validate_parser = subparsers.add_parser("validate",
+        help="validate the metadata of a UCoMP file")
+    validate_parser.add_argument("--level", type=str,
+       help="level of file to verify, 0 or 1, default=0",
+       default="0")
+    validate_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+       default="latest")
+    validate_parser.add_argument("files", nargs="+",
+       help="UCoMP files",
+       metavar="files")
+    validate_parser.set_defaults(func=validate, parser=validate_parser)
+
+    # log sub-command
+    log_parser = subparsers.add_parser("log",
+        help="display, and optionally filter, log output")
+    log_parser.add_argument("logfiles", nargs="+",
+        help="UCoMP log filename or date",
+        metavar="logfile")
+    log_parser.add_argument("-l", "--level",
+        help="filter level: DEBUG INFO WARN ERROR CRITICAL (default DEBUG)")
+    log_parser.add_argument("-p", "--prune",
+        help="delete rotated logs with versions higher than MAX_VERSION",
+        metavar="MAX_VERSION")
+    log_parser.add_argument("-f", "--follow",
+        help="output appended data as file grows",
+        action="store_true")
+    log_parser.add_argument("-t", "--tail",
+        help="show the last 10 lines of the log at the otherwise given level",
+        action="store_true")
+    log_parser.add_argument("-d", "--debug",
+        help="DEBUG filter level",
+        action="store_true")
+    log_parser.add_argument("-i", "--info",
+        help="INFO filter level",
+        action="store_true")
+    log_parser.add_argument("-w", "--warn",
+        help="WARN filter level",
+        action="store_true")
+    log_parser.add_argument("-e", "--error",
+        help="ERROR filter level",
+        action="store_true")
+    log_parser.add_argument("-c", "--critical",
+        help="CRITICAL filter level",
+    action="store_true")
+    log_parser.set_defaults(func=filter_log, parser=log_parser)
+
+    # missing sub-command
+    missing_parser = subparsers.add_parser("missing",
+        help="list missing files for a given day")
+    missing_parser.add_argument("dates", type=str, nargs="*", help=date_help,
+        metavar="date-expr")
+    missing_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    missing_parser.add_argument("-s", "--script", help="create bash script",
+        action="store_true")
+    missing_parser.set_defaults(func=missing, parser=missing_parser)
+
+    # versions sub-command
+    versions_parser = subparsers.add_parser("versions", help="list versions")
+    versions_parser.add_argument("dates", type=str, nargs="*", help=date_help,
+        metavar="date-expr")
+    versions_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    versions_parser.add_argument("--filter", type=str,
+        help="expression to filter versions by",
+        default=None)
+    versions_parser.add_argument("-o", "--oldest", action="store_true",
+        help="set to only display the oldest version")
+    versions_parser.add_argument("-n", "--none", action="store_true",
+        help="set to only display the dates with no version")
+    versions_parser.add_argument("-s", "--summary", action="store_true",
+        help="set to display a summary of versions")
+    versions_parser.set_defaults(func=versions, parser=versions_parser)
+
+    # database sub-command
+    database_parser = subparsers.add_parser("database", aliases=["db"],
+        help="database queries")
+    database_parser.add_argument("query", type=str, help="SQL query")
+    database_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    database_parser.add_argument("-c", "--columns", type=str, default=None,
+        help="columns to display")
+    database_parser.set_defaults(func=database, parser=database_parser)
+
+    # watch sub-command
+    watch_parser = subparsers.add_parser("watch", help="watch incoming data")
+    watch_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    watch_parser.add_argument("date", type=str,
+        help="date to run on in the form YYYYMMDD")
+    watch_parser.set_defaults(func=watch, parser=watch_parser)
+
+    # eod, rt, cal sub-commands
+    eod_parser = subparsers.add_parser("end-of-day", aliases=["eod"],
+        help="run end-of-day pipeline")
+    rt_parser = subparsers.add_parser("realtime", aliases=["rt"],
+        help="run realtime pipeline")
+    cal_parser = subparsers.add_parser("calibration", aliases=["cal"],
+        help="produce calibration files for the date(s)")
+    reprocess_parser = subparsers.add_parser("reprocess",
+        help="reprocess date(s)")
+    clearday_parser = subparsers.add_parser("clearday",
+        help="clear database and processing for date(s)")
+
+    eod_parser.add_argument("dates", type=str, help=date_help, nargs="*",
+        metavar="date-expr")
+    rt_parser.add_argument("dates", type=str, help=date_help, nargs="*",
+        metavar="date-expr")
+    cal_parser.add_argument("dates", type=str, help=date_help, nargs="*",
+        metavar="date-expr")
+    reprocess_parser.add_argument("dates", type=str, help=date_help, nargs="*",
+        metavar="date-expr")
+    clearday_parser.add_argument("dates", type=str, help=date_help, nargs="*",
+        metavar="date-expr")
+
+    eod_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    rt_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    cal_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    reprocess_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    clearday_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+
+    nowait_help = "set to run all dates simultaneously"
+    eod_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    rt_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    cal_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    reprocess_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    clearday_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+
+    eod_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    rt_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    cal_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    reprocess_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    clearday_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+
+    eod_parser.set_defaults(func=process_eod, parser=eod_parser)
+    rt_parser.set_defaults(func=process_rt, parser=rt_parser)
+    cal_parser.set_defaults(func=process_cal, parser=cal_parser)
+    reprocess_parser.set_defaults(func=reprocess, parser=reprocess_parser)
+    clearday_parser.set_defaults(func=clearday, parser=reprocess_parser)
+
+    # archive sub-command
+    archive_parser = subparsers.add_parser("archive",
+        help="archive files to long-term storage")
+    archive_parser.add_argument("dates", type=str, nargs="*", help=date_help,
+        metavar="date-expr")
+    archive_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    archive_parser.add_argument("-l", "--level", type=str, default=None,
+        help="level to archive: 0, 1, or 2")
+    archive_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    archive_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    archive_parser.set_defaults(func=archive, parser=archive_parser)
+
+    # regression sub-command
+    regression_parser = subparsers.add_parser("regress",
+        help="check end-of-day against previous results")
+    regression_parser.add_argument("dates", type=str, nargs="*", help=date_help,
+        metavar="date-expr")
+    regression_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    regression_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    regression_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    regression_parser.set_defaults(func=regression, parser=regression_parser)
+
+    # verify sub-command
+    verify_parser = subparsers.add_parser("verify",
+        help="verify previously processed date(s)")
+    verify_parser.add_argument("dates", type=str, nargs="*", help=date_help,
+        metavar="date-expr")
+    verify_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    verify_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    verify_parser.set_defaults(func=verify, parser=verify_parser)
+
+    # simulate sub-command
+    simulate_parser = subparsers.add_parser("simulate",
+        help="simulate realtime processing")
+    simulate_parser.add_argument("date", type=str, nargs=1,
+        help="date to run on in the form YYYYMMDD")
+    simulate_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    simulate_parser.add_argument("--no-eod", action="store_true",
+        help="set to not launch end-of-day processing")
+    simulate_parser.set_defaults(func=simulate, parser=simulate_parser)
+
+    # script sub-command
+    script_parser = subparsers.add_parser("script",
+        help="run a specified script on date(s)")
+    script_parser.add_argument("dates", type=str, nargs="*", help=date_help,
+        metavar="date-expr")
+    script_parser.add_argument("-f", "--flags", type=str, help=flags_help,
+        default="latest")
+    script_parser.add_argument("-n", "--name", type=str, help="name of script",
+        required=True)
+    script_parser.add_argument("--no-wait", action="store_true", help=nowait_help)
+    script_parser.add_argument("--verbose", action="store_true",
+        help="set to show more information on launch")
+    script_parser.set_defaults(func=run_script, parser=script_parser)
+
+    # uncomment the following line and the shtab import at the top of this file
+    # to generate a bash completion file
+    # print(shtab.complete(parser, shell="bash"))
+
+    # parse args and call appropriate sub-command
+    args = parser.parse_args()
+    if parser.get_default("func"):
+        try:
+            args.func(args)
+        except KeyboardInterrupt:
+            print()
+    else:
+        parser.print_help()

@@ -1,0 +1,25 @@
+#!/bin/sh
+
+FLAGS=$1
+
+if [[ ! -z "$FLAGS" ]]; then
+  FLAGS=.${FLAGS}
+fi
+
+rm -rf build
+mkdir build
+cd build
+
+#IDL_ROOT_DIR=/opt/share/idl8.6/idl86
+IDL_ROOT_DIR=/opt/share/idl8.7.3/idl87
+#IDL_ROOT_DIR=/opt/share/idl8.9/idl89
+PYTHON_ROOT_DIR=/home/mgalloy/anaconda3
+
+/home/mgalloy/software/bin/cmake \
+  -DCMAKE_INSTALL_PREFIX:PATH=~/software/ucomp-pipeline${FLAGS} \
+  -DCONFIG_DIR:PATH=/home/mgalloy/projects/ucomp-config \
+  -DIDL_ROOT_DIR:PATH=${IDL_ROOT_DIR} \
+  -DPython3_ROOT_DIR:PATH=${PYTHON_ROOT_DIR} \
+  -DNIGHTLY_MACHINE:STRING=dawn \
+  -DNIGHTLY_SSH_KEY:STRING=/home/mgalloy/.ssh/id_rsa2 \
+  ..

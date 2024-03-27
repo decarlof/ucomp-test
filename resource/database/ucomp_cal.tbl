@@ -1,0 +1,56 @@
+-- TODO: ask Giuliana: center info for occulter and field stop (2 sets)
+--                     (distortion corrected)?
+
+-- one entry per flat/dark or actual pol calibration file, just line center
+
+create table ucomp_cal (
+  cal_id                  int (10) auto_increment primary key,
+  file_name               char (40) not null,
+  date_obs                datetime not null,
+  obsday_id               mediumint (5) not null,
+
+  wave_region             char (4),
+  type                    char (8),
+  quality                 mediumint (5),
+
+  n_points                tinyint (2),
+  level_id                tinyint (2) not null,
+  exptime                 float (7, 4),
+  gain_mode               char (4),
+  nd                      tinyint (2),
+  cover                   tinyint (1),
+  darkshutter             tinyint (1),
+  opal                    tinyint (1),
+  occulter                tinyint (1),
+  polangle                float (8, 3),  -- TODO: does this change per ext?
+  retangle                float (8, 3),  -- TODO: does this change per ext?
+  caloptic                tinyint (1),
+
+  -- smoothness for center wavelength of flats
+  rcam_roughness          float (12, 7),
+  tcam_roughness          float (12, 7),
+
+  dark_id                 char (20),
+  rcamnuc                 char (30),
+  tcamnuc                 char (30),
+
+  -- normalized to 80 ms exposure time and NUMSUM=16
+  rcam_median_continuum   float (14, 7),
+  rcam_median_linecenter  float (14, 7),
+  tcam_median_continuum   float (14, 7),
+  tcam_median_linecenter  float (14, 7),
+
+  occltrid                char (10),
+
+  ucomp_sw_id             int (10),
+
+  unique (file_name),
+
+  index (date_obs),
+  index (obsday_id),
+
+  foreign key (level_id) references ucomp_level(level_id),
+  foreign key (ucomp_sw_id) references ucomp_sw(sw_id),
+
+  foreign key (obsday_id) references mlso_numfiles(day_id)
+)
